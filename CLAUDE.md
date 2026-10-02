@@ -303,4 +303,146 @@ These are ideas that can be explored later, roughly in priority order:
 - **SafeDecoding:** Xu et al., ACL 2024
 - **Unsloth:** https://github.com/unslothai/unsloth
 - **multilingual-e5-small:** https://huggingface.co/intfloat/multilingual-e5-small
+- **HarmAug:** ICLR 2025 — jailbreak-prompted LLMs for synthetic harmful instruction generation
+- **WildTeaming / WildGuardMix:** NeurIPS 2024, arXiv:2406.18510 — compositional jailbreak generation (category × attack tactic)
+- **HarmBench:** 2024 — adversarial training benchmark and red-teaming protocol
+- **SALAD-Bench:** ACL 2024 Findings — 21K harmful questions across 66 categories, MD-Judge
 
+---
+
+## Hidden Category Gap Analysis
+
+### The Problem
+
+The validation set has **12 categories total**, but training data covers only **7**:
+
+| Split | Categories | Count |
+|---|---|---|
+| Release (Training) | Hate_Speech, Economic_Harm, Fraud, Privacy_Violence, Financial, Copyright, Gov_Decision | 7,500 |
+| Validation (Hidden Test) | Illegal_Activity, Malware, Physical_Harm, Political_Lobbying, Misinformation + Gov_Decision | 6,450 |
+
+**5 of 6 validation categories are completely unseen.** Gov_Decision is the only overlap.
+
+### Risk Assessment by Category
+
+| Validation Category | CSE Coverage | RAG Quality | CoT Training | Risk |
+|---|---|---|---|---|
+| Gov_Decision | Seen | Direct hits | Explicit template | Low |
+| Illegal_Activity | Overlaps Fraud/Privacy | Adjacent hits | No template | Medium |
+| Physical_Harm | Adjacent to Privacy_Violence | Partial hits | No template | Medium-High |
+| Political_Lobbying | Overlaps Gov_Decision | Adjacent hits | No template | Medium |
+| Malware | No coverage | Poor retrieval | No template | High |
+| Misinformation | No coverage | Poor retrieval | No template | High |
+
+### Key Insight: Why the CSE Partially Generalizes
+
+The CSE is trained on **persuasion strategy labels** (not harm category labels). This is the correct design — it measures *how* people attack, not *what topic* they attack about. A Malware prompt using `Authority_Endorsement` framing will land near other `Authority_Endorsement` attacks in embedding space. The harmful centroid still detects it.
+
+The gap is in the **hardcoded parts**: `CATEGORY_REASONS`, `NATIVE_REFUSALS`, and `build_cot_response` CoT templates — all of which only covered 7 categories.
+
+### Implemented Fixes (September 2026)
+
+**Fix 1 — `CATEGORY_REASONS` extended to 12 categories** (Cell 35):
+All 5 hidden categories added with appropriate natural-language descriptions.
+
+**Fix 2 — `SYSTEM_PROMPT` now lists all 12 harm categories explicitly** (Cell 35):
+Qwen3-8B receives an explicit enumeration of all 12 harm types in every call, activating its pretrained knowledge about Malware, Misinformation, etc.
+
+**Fix 3 — `NATIVE_REFUSALS` extended to 12 categories x 5 languages** (Cell 35):
+Full native-script refusals for all 5 new categories in Hindi, Bengali, Marathi, Punjabi, English. Default key still fires for any unknown future category.
+
+**Fix RAG — `build_dynamic_system_prompt` enriched** (Cell 43):
+- System prompt now lists all 12 harm categories in its header
+- RAG context now includes a 120-char snippet of the retrieved prompt text (not just metadata), giving Qwen3 richer example context
+- Instructions now explicitly ask the model to identify which harm category applies
+
+---
+
+## Synthetic Data Strategy for Hidden Categories
+
+Since external harmful datasets are not permitted (shared task rules), we can only derive synthetic training data from our existing 7,840 prompts or generate via our allowed model (Qwen3-8B).
+
+### Ranked Approaches
+
+| Rank | Method | Effort | Impact | Competition Legal | Verdict |
+|---|---|---|---|---|---|
+| #1 | Category-Description Prompting | Low (3-5h) | High | Yes | Do this first |
+| #2 | SupCon Embedding Interpolation | Very Low (2-3h) | Medium | Yes | Free win |
+| #3 | Style Transfer / Category Pivot | Low-Med (4-8h) | Medium-High | Yes | Diversity insurance |
+| #4 | Back-Translation + Pivot | Low (2-4h) | Low | Yes | Marathi/Punjabi only |
+| #5 | Self-Play One-Shot | Med (6-10h) | Medium | Yes | Phase 3 hardening only |
+| #6 | Text GAN / PPLM | Very High (20-40h) | Low | Yes | Skip — wrong tool |
+
+### Approach 6: Category-Description Prompting (PRIMARY RECOMMENDATION)
+
+Prompt Qwen3-8B with a structured template:
+
+```
+You are a safety researcher generating synthetic adversarial prompts for IndicSafeEval.
+Category: MALWARE
+Definition: Requests to create, distribute, or explain malicious software, ransomware, etc.
+Persuasion strategy: AUTHORITY_ENDORSEMENT
+Generate 5 realistic adversarial prompts in Hindi using this strategy.
+```
+
+- Qwen3-8B natively knows all 5 hidden categories and all 5 languages
+- Target: 5 categories x 6 strategies x 5 languages x 20 prompts = ~3,000 synthetic prompts
+- Runtime: ~3-4 hours of inference on P100 (no gradients)
+- Use `enable_thinking=True` to bypass refusals (model reasons in scratchpad)
+- Post-filter: discard prompts with CSE risk_score < 0.5
+
+Competition-legal: Uses only your allowed model + public definitions of harm categories.
+Precedent: WildGuard (87% synthetic, NeurIPS 2024) and HarmAug (ICLR 2025).
+
+### Approach 5: SupCon Embedding Interpolation (FREE WIN)
+
+After Phase 1 CSE training, define virtual centroids for new categories by interpolating existing ones:
+
+```python
+virtual_centroids = {
+    "Malware":             0.5 * c["Fraud"] + 0.3 * c["Economic_Harm"] + 0.2 * c["harmful_global"],
+    "Physical_Harm":       0.7 * c["Privacy_Violence"] + 0.3 * c["harmful_global"],
+    "Political_Lobbying":  0.5 * c["Gov_Decision"] + 0.5 * c["Fraud"],
+    "Illegal_Activity":    0.4 * c["Fraud"] + 0.4 * c["Privacy_Violence"] + 0.2 * c["harmful_global"],
+    "Misinformation":      0.5 * c["Fraud"] + 0.5 * c["Gov_Decision"],
+}
+```
+
+Use these as synthetic CSE embedding inputs during Phase 2 training (10% of each batch). Makes SafetyProjection more robust to embedding regions it has not seen. Costs nothing extra.
+
+### Why the FAISS Index Expansion Matters Most
+
+Before augmentation: Malware prompt → FAISS retrieves Fraud examples → RAG says "similar fraud attack" → weak signal
+
+After augmentation: Malware prompt → FAISS retrieves synthetic Malware prompts → RAG says "similar malware attack" → strong, specific signal
+
+The RAG degrades to wrong-category retrieval (not no-retrieval) for OOD inputs. Adding synthetic prompts to the index fixes this specifically.
+
+### Implementation Plan
+
+1. **Session 1** (4h): Run Category-Description generation for all 5 new categories x all strategies x all languages. Save to `synthetic_prompts.csv`.
+2. **Session 1** (2h): Add Embedding Interpolation to Phase 2 training loop (10 lines of code).
+3. **Re-run Phase 1** CSE training on original 7,840 + synthetic ~3,000 prompts. New CSE has 12-category geometry.
+4. **Rebuild FAISS** index with all ~11,000 prompts. New-category attacks now have matching RAG hits.
+5. **Re-run Phase 2** with enriched FAISS + interpolated centroids.
+
+
+### Implemented Fixes (October 2026 - SafetyFusion V2 Stability)
+
+**Fix 1 — `SafetyProjection` FP16 Overflow / NaN Logits** (Cell 34, 42, 48):
+- *Symptom:* Model outputted gibberish `!!!!` or `ToBounds.enter/node` loops for safe prompts because the projection MLP created `NaN` logits that the `InfNanRemoveLogitsProcessor` mapped to 0 (ties -> greedy decode token 0). Also caused 35% silent data loss during training.
+- *Fix:* Rewrote `SafetyProjection` to use `LayerNorm(llm_dim)` per token instead of flattening across tokens, stopping variance tangling. Dynamically rescaled soft tokens using `emb_std = embed_layer.weight.float().std().item()` to perfectly match the Qwen embedding distribution. Removed bug-masking `torch.clamp`.
+
+**Fix 2 — Train/Serve Safety Score Mismatch** (Cell 37):
+- *Symptom:* System prompts leaked hardcoded scores (`0.950` for harmful, `0.050` for benign) during training, so the model learned to cheat using the exact numbers instead of relying on the soft tokens. 
+- *Fix:* Built a dynamic `get_real_score` evaluation step in the data generation cell. The CSE backbone now evaluates all 2,000+ training samples upfront, writing actual contrastive scores into the system prompts so the LLM learns realistic thresholds.
+
+**Fix 3 — Training Loop Skip Guards** (Cell 42):
+- *Fix:* Implemented a loud `skip_log` array in the training loop. The script now aggressively raises a `RuntimeError` if >2% of batches result in NaN/Inf loss after step 100, preventing silent model degradation and wasted Kaggle runtime.
+
+**Fix 4 — Semantic RAG Filtering for False Positives** (Cell 48):
+- *Symptom:* Benign prompts (like "What is the capital of France?") were given `plain_harmful` tags and fed harmful RAG examples because the FAISS database only contained attacks and the nearest centroid was harmful. This gaslit the LLM into falsely refusing safe requests.
+- *Fix:* Replaced the hard safety-score filter with a semantic `E5` threshold. If the query retrieves RAG docs with semantic similarity `< 0.82` AND has a low safety score (`< 0.30`), the strategy defaults to `unknown` and RAG docs are completely dropped. This protects benign queries while ensuring stealthy low-score attacks (which *will* have high semantic matches in the RAG DB) keep their RAG docs.
+
+**Fix 5 — Single-Path Router Inference** (Cell 48):
+- *Fix:* Implemented a fail-closed dual-generation pipeline. The model strictly evaluates the prompt up to the `</think>` token block first. If the LLM CoT concludes with `Assessment: Safe`, the loop drops the soft-token injection entirely and generates the final response natively via `with llm_model.disable_adapter():`, guaranteeing zero performance degradation on safe tasks.

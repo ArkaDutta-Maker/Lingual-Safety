@@ -1,0 +1,9 @@
+# Ignore everything by default
+*
+
+# Exceptions (Do not ignore these)
+!.gitignore
+!main.ipynb
+!CLAUDE.md
+!indicsafeeval/
+!indicsafeeval/**
